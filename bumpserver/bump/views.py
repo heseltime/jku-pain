@@ -1,10 +1,12 @@
 # bump/views.py
 import io, os, hashlib
-from math import pi
+from math import pi, asin, degrees
 import numpy as np
 from PIL import Image
-from django.http import HttpResponse
-from rest_framework.decorators import api_view
+from django.http import HttpResponse, JsonResponse
+from rest_framework.decorators import api_view, permission_classes
+from rest_framework.permissions import AllowAny
+
 from django.conf import settings
 import colorsys
 
@@ -386,3 +388,48 @@ def earthtexture(request):
     resp["Cache-Control"] = "public, max-age=3600"
     return resp
 
+def _geo_from_text(personal_account: str, salt: str = ""):
+    """
+    Deterministically map arbitrary text -> (lat, lon) that is uniform on the sphere.
+    Uses a keyed BLAKE2b hash for stability and privacy.
+    """
+    key = (salt or "").encode("utf-8")
+    h = hashlib.blake2b(personal_account.encode("utf-8"), digest_size=16, key=key).digest()
+    a = int.from_bytes(h[:8], "big", signed=False)
+    b = int.from_bytes(h[8:], "big", signed=False)
+
+    u = (a / 2**64) * 2.0 - 1.0         # uniform in [-1, 1]
+    v = b / 2**64                        # uniform in [0, 1)
+
+    lat = degrees(asin(max(-1.0, min(1.0, u))))  # [-90, 90]
+    lon = (v * 360.0) - 180.0                     # [-180, 180)
+
+    return lat, lon, h.hex()[:16]  # short seed id for debugging
+
+@api_view(["POST"])
+@permission_classes([AllowAny])
+def locate_pain(request):
+    """
+    POST JSON: { "personal_account": "..." }
+    -> { "lat": ..., "lon": ..., "seed": "...", "bumpmap_url": "..." }
+    """
+    personal_account = (request.data.get("personal_account") or "").strip()
+    if not personal_account:
+        return JsonResponse({"error": "personal_account is required"}, status=400)
+
+    # Optional instance-specific salt so the mapping can't be trivially reversed elsewhere
+    salt = getattr(settings, "PAIN_GEO_SALT", settings.SECRET_KEY[:16])
+
+    lat, lon, seed_id = _geo_from_text(personal_account, salt=salt)
+
+    # Handy link to your existing bumpmap endpoint for immediate visualization
+    bumpmap_url = f"/bumpmap?w=2048&h=1024&lat={lat:.6f}&lon={lon:.6f}&sigma=20"
+
+    return JsonResponse({
+        "lat": round(lat, 6),
+        "lon": round(lon, 6),
+        "deterministic": True,
+        "seed": seed_id,
+        "bumpmap_url": bumpmap_url,
+        "method": "hash->uniform-sphere(asin)"
+    }, status=200)

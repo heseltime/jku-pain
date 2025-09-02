@@ -117,19 +117,35 @@ curl -L -o earth_cmy_soft.png \
 Multi-color hue version of the earth map. Generates a soft, multi-hue CMY heat-map version of the grayscale Earth day texture (cyan → magenta → yellow with gentle dark/bright knees).
 
 
-## questionaire
+## locate_pain
 
 ### Input
 
+Text pain prompt.
+
 ### POST Parameters
+
+`personal_account` in JSON schema.
 
 ### Examples
 
-### Output
-
-Location coordinates mainly, and pain signature (DTO needed) as well as a first-person pain narrative combining personal and social/ecological pain, e.g.
-
 ```bash
-I have lost 67% of my biodiversity. My country’s GDP is 0.51, and my average temperature has risen 2 degrees. The people tweet the most about anxiety and chronic pain. And my rivers have levels of lead and mercury. My air quality index is PM2.5.
+curl -X POST http://localhost:8000/api/locate-pain \
+  -H "Content-Type: application/json" \
+  -d '{"personal_account":"I feel a tightness in my chest when thinking about wildfires."}'
 ```
 
+### Output
+
+Location coordinates mainly:
+
+```bash
+{
+    "lat": -68.269179, 
+    "lon": -111.796729, 
+    "deterministic": true, 
+    "seed": "0918b4a9b7469719", 
+    "bumpmap_url": "/bumpmap?w=2048&h=1024&lat=-68.269179&lon=-111.796729&sigma=20", 
+    "method": "hash->uniform-sphere(asin)"
+}
+```
