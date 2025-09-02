@@ -5,9 +5,11 @@
 
 # Documentation
 
-Main endpoint: `/api/bumpmap/` (deployed on render: `https://pain-ix0y.onrender.com/api/bumpmap/`)
+## bumpmap
 
-## Parameters
+Main endpoint: `/api/bumpmap/` (deployed on render: `https://pain-ix0y.onrender.com/api/bumpmap/`) For generating a dent in the unshapely pain earth body: this should ultimately **reflect a global state of pain** based on user questionaire submissions. (This leads into another endpoint, where these questionaires are submitted to, providing feedback to the client in terms of the pain dimensions of this project.)
+
+### Parameters
 
 | Name        | Type  | Default | Range/Notes                                                                 |
 |-------------|-------|---------|------------------------------------------------------------------------------|
@@ -23,7 +25,7 @@ Main endpoint: `/api/bumpmap/` (deployed on render: `https://pain-ix0y.onrender.
 
 ---
 
-## Examples
+### Examples
 
 **Default (8K grayscale around Europe)**
 ```bash
@@ -53,3 +55,25 @@ curl -L -o bump.jpg \
 ```bash
 curl -I "https://pain-ix0y.onrender.com/api/bumpmap/?w=1024&h=512&sigma=20"
 ```
+
+### Output
+
+Black and white bumpmap image.
+
+## cloudmap
+
+Environmental, real time pain, rendered as colored clouds shrouding the pain body.
+
+### Parameteres
+
+### Examples
+
+### Output
+
+## questionaire
+
+### POST Parameters
+
+### Examples
+
+### Output
