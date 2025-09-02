@@ -28,28 +28,28 @@ Main endpoint: `/api/bumpmap/` (deployed on render: `https://pain-ix0y.onrender.
 **Default (8K grayscale around Europe)**
 ```bash
 curl -L -o europe_bump_8k.png \
-  "https://<your-host>/api/bumpmap/"
+  "https://pain-ix0y.onrender.com/api/bumpmap/"
 ```
 
 **Scale up crater ~2× (effective radius 40°)**
 ```bash
 curl -L -o bump_big.png \
-  "https://<your-host>/api/bumpmap/?sigma=20&scale=2"
+  "https://pain-ix0y.onrender.com/api/bumpmap/?sigma=20&scale=2"
 ```
 
 **Binary mask with custom threshold**
 ```bash
 curl -L -o europe_mask.png \
-  "https://<your-host>/api/bumpmap/?hard=1&threshold=0.3"
+  "https://pain-ix0y.onrender.com/api/bumpmap/?hard=1&threshold=0.3"
 ```
 
 **JPEG instead of PNG**
 ```bash
 curl -L -o bump.jpg \
-  "https://<your-host>/api/bumpmap/?fmt=jpg"
+  "https://pain-ix0y.onrender.com/api/bumpmap/?fmt=jpg"
 ```
 
 **Quick health check (headers only)**
 ```bash
-curl -I "https://<your-host>/api/bumpmap/?w=1024&h=512&sigma=20"
+curl -I "https://pain-ix0y.onrender.com/api/bumpmap/?w=1024&h=512&sigma=20"
 ```
