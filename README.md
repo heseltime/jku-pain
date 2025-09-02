@@ -1,4 +1,4 @@
 🥐 **Johannes Kepler University MED Faculty and Ludwig Boltzmann Institutes: Transforming Medicine through AI and Art**
 
 > [!NOTE]  
-> Project Server 
+> **P.ersonal A.nd I.n N.ature** Project Server 
