@@ -49,12 +49,26 @@ def bumpmap(request):
     h = int(request.GET.get("h", 4096))
     lat = float(request.GET.get("lat", 50.0))
     lon = float(request.GET.get("lon", 10.0))
-    sigma = float(request.GET.get("sigma", 20.0))
+    sigma = float(request.GET.get("sigma", 20.0))  # base radius in degrees
+
+    # NEW: optional scale multiplier for the "crater" size
+    try:
+        scale = float(request.GET.get("scale", 1.0))
+    except (TypeError, ValueError):
+        scale = 1.0
+    # keep it positive and within a reasonable range
+    if scale <= 0 or not np.isfinite(scale):
+        scale = 1.0
+    scale = max(0.1, min(scale, 10.0))  # allow 0.1x .. 10x
+
+    sigma_eff = sigma * scale  # effective radius in degrees
+
     hard = _parse_bool(request.GET.get("hard"), False)
     threshold = float(request.GET.get("threshold", 0.35))
     fmt = (request.GET.get("fmt", "png") or "png").lower()
 
-    img = _equirectangular_gaussian_memsafe(w, h, lat, lon, sigma, hard, threshold)
+    # use effective sigma
+    img = _equirectangular_gaussian_memsafe(w, h, lat, lon, sigma_eff, hard, threshold)
 
     buf = io.BytesIO()
     if fmt in ("jpg", "jpeg"):
@@ -65,9 +79,11 @@ def bumpmap(request):
         ctype = "image/png"
     body = buf.getvalue()
 
-    etag = hashlib.md5(f"{w}x{h}:{lat}:{lon}:{sigma}:{hard}:{threshold}:{fmt}".encode()).hexdigest()
+    # include sigma_eff in the cache key
+    etag = hashlib.md5(f"{w}x{h}:{lat}:{lon}:{sigma_eff}:{hard}:{threshold}:{fmt}".encode()).hexdigest()
     resp = HttpResponse(b"" if request.method == "HEAD" else body, content_type=ctype)
     resp["Content-Length"] = str(len(body))
     resp["ETag"] = etag
     resp["Cache-Control"] = "public, max-age=3600"
     return resp
+
