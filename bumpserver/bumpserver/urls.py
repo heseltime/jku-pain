@@ -15,11 +15,11 @@ Including another URLconf
     2. Add a URL to urlpatterns:  path('blog/', include('blog.urls'))
 """
 from django.contrib import admin
-from django.urls import path
+from django.urls import path, re_path
 from bump.views import bumpmap 
 
 urlpatterns = [
     path('admin/', admin.site.urls),
-    path('api/bumpmap/', bumpmap, name='bumpmap'),
+    path('api/bumpmap/', bumpmap, name='bumpmap'),     # with slash
+    re_path(r'^api/bumpmap$', bumpmap),                # without slash
 ]
-
