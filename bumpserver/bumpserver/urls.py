@@ -16,7 +16,7 @@ Including another URLconf
 """
 from django.contrib import admin
 from django.urls import path, re_path
-from bump.views import bumpmap, cloudmap
+from bump.views import bumpmap, cloudmap, earthtexture
 
 urlpatterns = [
     path('admin/', admin.site.urls),
@@ -24,4 +24,6 @@ urlpatterns = [
     re_path(r'^api/bumpmap$', bumpmap),                # without slash
     path('api/cloudmap/', cloudmap),
     re_path(r'^api/cloudmap$', cloudmap),
+    path('api/earthtexture/', earthtexture),
+    re_path(r'^api/earthtexture$', earthtexture),
 ]

@@ -1,10 +1,17 @@
 # bump/views.py
-import io, hashlib
+import io, os, hashlib
 from math import pi
 import numpy as np
 from PIL import Image
 from django.http import HttpResponse
 from rest_framework.decorators import api_view
+from django.conf import settings
+import colorsys
+
+EARTH_SRC_PATH = os.getenv(
+    "EARTH_TEXTURE_SRC",
+    str((settings.BASE_DIR / "assets" / "8k_earth_daymap_greyscale.jpg").resolve())
+)
 
 def _parse_bool(v, default=False):
     return str(v).lower() in ("1","true","t","yes","y","on") if v is not None else default
@@ -245,6 +252,134 @@ def cloudmap(request):
         f"{w}x{h}:{seed}:{octaves}:{lac}:{gain}:{freq}:{contrast}:{gamma}:{cover}:{anom}:{alpha_on}:{fmt}".encode()
     ).hexdigest()
 
+    resp = HttpResponse(b"" if request.method == "HEAD" else body, content_type=ctype)
+    resp["Content-Length"] = str(len(body))
+    resp["ETag"] = etag
+    resp["Cache-Control"] = "public, max-age=3600"
+    return resp
+
+
+def _cmy_rainbow_lut(n=256, pastel=0.35, low_k=0.06, high_k=0.04):
+    import numpy as np
+    # --- sRGB <-> linear helpers ---
+    def srgb_to_linear(c):
+        a = 0.055
+        return np.where(c <= 0.04045, c/12.92, ((c + a)/(1 + a))**2.4)
+    def linear_to_srgb(c):
+        a = 0.055
+        return np.where(c <= 0.0031308, 12.92*c, (1 + a)*(c**(1/2.4)) - a)
+    def mix(a, b, t): return a*(1.0 - t) + b*t
+
+    # base CMY in sRGB
+    cyan, magenta, yellow = [np.array(v, np.float32)
+        for v in ((0,1,1), (1,0,1), (1,1,0))]
+    black = np.zeros(3, np.float32)
+    white = np.ones(3,  np.float32)
+
+    # pastelize anchors by mixing with white
+    cyan_p    = mix(cyan,    white, pastel)
+    magenta_p = mix(magenta, white, pastel)
+    yellow_p  = mix(yellow,  white, pastel)
+
+    # calmer extremes
+    dark_teal  = mix(black, cyan_p, 0.65)     # deep low end
+    near_white = mix(white, yellow_p, 0.85)   # warm high end
+
+    # control points (0..1): 5 stops → 4 segments
+    pos = np.array([0.0, low_k + 0.18, 0.50, 1.0 - high_k - 0.18, 1.0], np.float32)
+    stops_lin = [srgb_to_linear(x) for x in (dark_teal, cyan_p, magenta_p, yellow_p, near_white)]
+
+    xs = np.linspace(0, 1, n, dtype=np.float32)
+    lut = np.zeros((n, 3), dtype=np.float32)
+    for i in range(4):
+        a, b = pos[i], pos[i+1]
+        m = (xs >= a) & (xs <= b)
+        if not np.any(m): continue
+        t = (xs[m] - a) / (b - a + 1e-8)
+        lut[m] = stops_lin[i]*(1-t)[:,None] + stops_lin[i+1]*t[:,None]
+
+    lut = np.clip(linear_to_srgb(lut), 0, 1)
+    return (lut*255 + 0.5).astype(np.uint8)
+
+def _apply_lut_chunk(gray_chunk: np.ndarray, lut: np.ndarray, gamma: float = 1.0, invert: bool = False):
+    if gamma != 1.0:
+        idx = ((gray_chunk.astype(np.float32) / 255.0) ** np.float32(gamma) * 255.0).astype(np.uint8)
+    else:
+        idx = gray_chunk
+    if invert:
+        idx = 255 - idx
+    return lut[idx]  # (H,W,3)
+
+@api_view(["GET", "HEAD", "OPTIONS"])
+def earthtexture(request):
+    """
+    Subtle multi-hue colorization of the grayscale Earth texture.
+
+    Query params:
+      w,h         Output size (default 8192x4096)
+      seed        RNG seed (default 1234)
+      nstops      3..12 color stops (default 6)
+      hue_span    0..1 hue range (default 0.18) — smaller = more subtle
+      vibrance    saturation multiplier (default 0.7)
+      bright      value multiplier (default 1.0)
+      gamma       grayscale gamma before LUT (default 1.0)
+      invert      0|1 invert grayscale (default 0)
+      strength    0..1 blend of color vs. grayscale (default 0.35)
+      alpha       0|1 add alpha=original grayscale (default 0)
+      fmt         png|jpg|jpeg (default png)
+    """
+    w = int(request.GET.get("w", 8192))
+    h = int(request.GET.get("h", 4096))
+    seed = int(request.GET.get("seed", 1234))
+    nstops = int(request.GET.get("nstops", 6))
+    hue_span = float(request.GET.get("hue_span", 0.18))
+    vibrance = float(request.GET.get("vibrance", 0.7))
+    bright = float(request.GET.get("bright", 1.0))
+    gamma = float(request.GET.get("gamma", 1.0))
+    invert = str(request.GET.get("invert", "0")).lower() in ("1","true","t","yes","y","on")
+    strength = float(request.GET.get("strength", 0.35))
+    strength = float(np.clip(strength, 0.0, 1.0))
+    alpha_on = str(request.GET.get("alpha", "0")).lower() in ("1","true","t","yes","y","on")
+    fmt = (request.GET.get("fmt", "png") or "png").lower()
+
+    # Load & resize grayscale
+    img = Image.open(EARTH_SRC_PATH).convert("L")
+    if img.size != (w, h):
+        img = img.resize((w, h), Image.LANCZOS)
+
+    lut = _cmy_rainbow_lut(n=256, pastel=float(request.GET.get("pastel", 0.35)))
+
+    chunk = 256
+    out = np.empty((h, w, 4 if alpha_on else 3), dtype=np.uint8)
+    for y0 in range(0, h, chunk):
+        y1 = min(h, y0 + chunk)
+        g = np.asarray(img.crop((0, y0, w, y1)), dtype=np.uint8)  # (rows, w)
+        rgb = _apply_lut_chunk(g, lut, gamma=gamma, invert=invert)  # (rows, w, 3)
+
+        # SUBTLE: blend back toward grayscale by 'strength'
+        if strength < 1.0:
+            gray3 = np.repeat(g[..., None], 3, axis=2)
+            rgb = ((1.0 - strength) * gray3 + strength * rgb).astype(np.uint8)
+
+        if alpha_on:
+            out[y0:y1] = np.concatenate([rgb, g[..., None]], axis=2)
+        else:
+            out[y0:y1] = rgb
+
+    out_img = Image.fromarray(out, mode="RGBA" if alpha_on else "RGB")
+
+    buf = io.BytesIO()
+    if fmt in ("jpg", "jpeg"):
+        out_img.save(buf, format="JPEG", quality=95, subsampling=0)
+        ctype = "image/jpeg"
+    else:
+        out_img.save(buf, format="PNG", optimize=True)
+        ctype = "image/png"
+    body = buf.getvalue()
+
+    etag = hashlib.md5(
+        f"{w}x{h}:{seed}:{nstops}:{hue_span}:{vibrance}:{bright}:{gamma}:{invert}:{strength}:{alpha_on}:{fmt}".encode()
+    ).hexdigest()
     resp = HttpResponse(b"" if request.method == "HEAD" else body, content_type=ctype)
     resp["Content-Length"] = str(len(body))
     resp["ETag"] = etag
