@@ -28,86 +28,178 @@ EARTH_SRC_PATH = os.getenv(
     str((settings.BASE_DIR / "assets" / "8k_earth_daymap_greyscale.jpg").resolve())
 )
 
+import io
+import os
+import hashlib
+from PIL import Image, ImageOps, ImageFilter
+from django.http import HttpResponse
+from django.conf import settings
+from rest_framework.decorators import api_view, parser_classes
+from rest_framework.parsers import MultiPartParser, FormParser
+import numpy as np
+import requests
+
+# ---------- default server-side image ----------
 EARTH_BUMPMAP_MASK_PATH = os.getenv(
     "EARTH_BUMPMAP_MASK_SRC",
-    str((settings.BASE_DIR / "assets" / "8k_earth_daymap_greyscale.jpg").resolve())
+    #str((settings.BASE_DIR / "assets" / "8k_earth_daymap_greyscale.jpg").resolve())
+    str((settings.BASE_DIR / "assets" / "standin-economic-data.jpeg").resolve())
 )
 
+# ---------- helpers ----------
 def _parse_bool(v, default=False):
     return str(v).lower() in ("1","true","t","yes","y","on") if v is not None else default
 
-def _equirectangular_gaussian_memsafe(
-    w: int, h: int,
-    lat0_deg: float = 50.0, lon0_deg: float = 10.0,
-    sigma_deg: float = 20.0, hard: bool = False, threshold: float = 0.35
-):
-    # Longitudes precomputed once (float32)
-    lon = np.linspace(-pi, pi, w, endpoint=False, dtype=np.float32)
-    lon0 = np.float32(np.deg2rad(lon0_deg))
-    dlon = (lon - lon0 + np.float32(pi)) % np.float32(2*pi) - np.float32(pi)
-    sin2_dlon = np.sin(dlon / 2.0) ** 2   # float32
+def _read_file_bytes(path: str) -> bytes:
+    with open(path, "rb") as f:
+        return f.read()
 
-    lat0 = np.float32(np.deg2rad(lat0_deg))
-    cos_lat0 = np.cos(lat0)               # float32
-    sigma = np.float32(np.deg2rad(sigma_deg))
+def _load_source_image_bytes(request):
+    """
+    Priority:
+      1) multipart 'mask' (file upload)
+      2) query param 'mask_url'
+      3) query param 'mask_path' (server filesystem)
+      4) EARTH_BUMPMAP_MASK_PATH (server default)
+    Returns (bytes, etag_bytes_hint)
+    """
+    # 1) file upload
+    if 'mask' in request.FILES:
+        b = request.FILES['mask'].read()
+        return b, hashlib.md5(b).digest()
 
-    out = np.empty((h, w), dtype=np.uint8)
-    lats = np.linspace(pi/2, -pi/2, h, dtype=np.float32)
+    # 2) URL
+    mask_url = request.GET.get('mask_url')
+    if mask_url:
+        r = requests.get(mask_url, timeout=10)
+        r.raise_for_status()
+        b = r.content
+        return b, hashlib.md5(b).digest()
 
-    for i in range(h):
-        lat = lats[i]
-        dlat = lat - lat0
-        sin2_dlat = np.sin(dlat / 2.0) ** 2
-        a = sin2_dlat + (np.cos(lat) * cos_lat0) * sin2_dlon
-        gc = 2.0 * np.arcsin(np.sqrt(a))             # radians
-        intensity = np.exp(-(gc * gc) / (2.0 * sigma * sigma))  # 0..1
+    # 3) server path
+    mask_path = request.GET.get('mask_path')
+    if mask_path and os.path.isfile(mask_path):
+        b = _read_file_bytes(mask_path)
+        return b, hashlib.md5(b).digest()
 
-        if hard:
-            row = (intensity >= threshold).astype(np.uint8) * 255
-        else:
-            row = np.clip(intensity * 255.0, 0, 255).astype(np.uint8)
-        out[i] = row
+    # 4) default
+    if os.path.isfile(EARTH_BUMPMAP_MASK_PATH):
+        b = _read_file_bytes(EARTH_BUMPMAP_MASK_PATH)
+        return b, hashlib.md5(b).digest()
 
-    return Image.fromarray(out, mode='L')
-
-@api_view(["GET", "HEAD", "OPTIONS"])
-def bumpmap(request):
-    w = int(request.GET.get("w", 8192))
-    h = int(request.GET.get("h", 4096))
-    lat = float(request.GET.get("lat", 50.0))
-    lon = float(request.GET.get("lon", 10.0))
-    sigma = float(request.GET.get("sigma", 20.0))  # base radius in degrees
-
-    # NEW: optional scale multiplier for the "crater" size
-    try:
-        scale = float(request.GET.get("scale", 1.0))
-    except (TypeError, ValueError):
-        scale = 1.0
-    # keep it positive and within a reasonable range
-    if scale <= 0 or not np.isfinite(scale):
-        scale = 1.0
-    scale = max(0.1, min(scale, 10.0))  # allow 0.1x .. 10x
-
-    sigma_eff = sigma * scale  # effective radius in degrees
-
-    hard = _parse_bool(request.GET.get("hard"), False)
-    threshold = float(request.GET.get("threshold", 0.35))
-    fmt = (request.GET.get("fmt", "png") or "png").lower()
-
-    # use effective sigma
-    img = _equirectangular_gaussian_memsafe(w, h, lat, lon, sigma_eff, hard, threshold)
-
+    # fallback: tiny white image to avoid 500s
+    im = Image.new("L", (512, 256), 255)
     buf = io.BytesIO()
-    if fmt in ("jpg", "jpeg"):
-        img.save(buf, format="JPEG", quality=95, subsampling=0)
-        ctype = "image/jpeg"
-    else:
-        img.save(buf, format="PNG", optimize=True)
-        ctype = "image/png"
-    body = buf.getvalue()
+    im.save(buf, format="PNG")
+    b = buf.getvalue()
+    return b, hashlib.md5(b).digest()
 
-    # include sigma_eff in the cache key
-    etag = hashlib.md5(f"{w}x{h}:{lat}:{lon}:{sigma_eff}:{hard}:{threshold}:{fmt}".encode()).hexdigest()
+def _auto_levels_u8(gray_u8: np.ndarray) -> np.ndarray:
+    """Stretch histogram to full [0,255] via per-image min/max."""
+    lo = int(gray_u8.min())
+    hi = int(gray_u8.max())
+    if hi <= lo:
+        return gray_u8
+    # scale to 0..255
+    out = (gray_u8.astype(np.float32) - lo) * (255.0 / (hi - lo))
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+# ---------- endpoint ----------
+@api_view(["GET", "POST", "HEAD", "OPTIONS"])
+@parser_classes([MultiPartParser, FormParser])
+def bumpmap(request):
+    """
+    Fast bumpmap: grayscale + gaussian blur.
+
+    Params:
+      - w, h: output size. If omitted -> keep source size.
+      - blur: Gaussian blur radius in pixels (float, default 6.0)
+      - gamma: apply gamma correction (default 1.0; >1.0 darkens midtones)
+      - invert: 0/1 flip grayscale
+      - normalize: 0/1 scale to [0,1] before output (kept implicit in 8-bit)
+      - auto_levels: 0/1 stretch to full [0,255] after blur (default 1)
+      - hard: 0/1 apply threshold at the end
+      - threshold: 0..1 threshold if hard=1 (default 0.35)
+      - fmt: png|jpg|jpeg (default png)
+      - seed: ignored (kept for parity)
+      - mask/mask_url/mask_path: input source overrides
+    """
+    fmt = (request.GET.get("fmt", request.POST.get("fmt", "png")) or "png").lower()
+    blur = float(request.GET.get("blur", request.POST.get("blur", 6.0)))
+    gamma = float(request.GET.get("gamma", request.POST.get("gamma", 1.0)))
+    invert = _parse_bool(request.GET.get("invert", request.POST.get("invert")), False)
+    auto_levels = _parse_bool(request.GET.get("auto_levels", request.POST.get("auto_levels", 1)), True)
+    hard = _parse_bool(request.GET.get("hard", request.POST.get("hard")), False)
+    threshold = float(request.GET.get("threshold", request.POST.get("threshold", 0.35)))
+
+    # Load source bytes and a stable hash for ETag
+    src_bytes, src_hash = _load_source_image_bytes(request)
+
+    # Open image
+    with Image.open(io.BytesIO(src_bytes)) as im_src:
+        im_src = im_src.convert("RGB")  # robust
+        # If w/h provided -> resize; else keep source size
+        w_param = request.GET.get("w", request.POST.get("w"))
+        h_param = request.GET.get("h", request.POST.get("h"))
+
+        if w_param and h_param:
+            w = int(w_param); h = int(h_param)
+            im_src = im_src.resize((w, h), Image.LANCZOS if hasattr(Image, "LANCZOS") else Image.BICUBIC)
+        else:
+            w, h = im_src.size
+
+        # Convert to grayscale
+        im_gray = ImageOps.grayscale(im_src)  # 'L'
+
+        # Optional gamma (convert to float for precision)
+        if gamma and gamma != 1.0:
+            arr = np.asarray(im_gray, dtype=np.uint8)
+            arrf = (arr.astype(np.float32) / 255.0) ** np.float32(gamma)
+            im_gray = Image.fromarray(np.clip(arrf * 255.0, 0, 255).astype(np.uint8), mode="L")
+
+        # Invert if requested
+        if invert:
+            im_gray = ImageOps.invert(im_gray)
+
+        # Gaussian blur (fast)
+        blur = max(0.0, float(blur))
+        if blur > 0.0:
+            im_gray = im_gray.filter(ImageFilter.GaussianBlur(radius=blur))
+
+        # Auto-levels to use full dynamic range (improves bump contrast)
+        if auto_levels:
+            arr = np.asarray(im_gray, dtype=np.uint8)
+            im_gray = Image.fromarray(_auto_levels_u8(arr), mode="L")
+
+        # Optional hard threshold for stylized masks
+        if hard:
+            thr = int(np.clip(threshold, 0.0, 1.0) * 255.0)
+            im_gray = im_gray.point(lambda v, t=thr: 255 if v >= t else 0, mode='L')
+
+        # Encode
+        buf = io.BytesIO()
+        if fmt in ("jpg", "jpeg"):
+            im_gray.save(buf, format="JPEG", quality=95, subsampling=0)
+            ctype = "image/jpeg"
+        else:
+            im_gray.save(buf, format="PNG", optimize=True)
+            ctype = "image/png"
+        body = buf.getvalue()
+
+    # ETag with params
+    etag_src = b"|".join([
+        src_hash,
+        f"{w}x{h}".encode(),
+        f"blur={blur}".encode(),
+        f"gamma={gamma}".encode(),
+        f"invert={int(invert)}".encode(),
+        f"autolvl={int(auto_levels)}".encode(),
+        f"hard={int(hard)}".encode(),
+        f"thr={threshold}".encode(),
+        f"fmt={fmt}".encode(),
+    ])
+    etag = hashlib.md5(etag_src).hexdigest()
+
     resp = HttpResponse(b"" if request.method == "HEAD" else body, content_type=ctype)
     resp["Content-Length"] = str(len(body))
     resp["ETag"] = etag
