@@ -37,7 +37,6 @@ from django.conf import settings
 from rest_framework.decorators import api_view, parser_classes
 from rest_framework.parsers import MultiPartParser, FormParser
 import numpy as np
-import requests
 
 # ---------- default server-side image ----------
 EARTH_BUMPMAP_MASK_PATH = os.getenv(
