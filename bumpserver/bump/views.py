@@ -41,7 +41,7 @@ import numpy as np
 # ---------- default server-side image ----------
 EARTH_BUMPMAP_MASK_PATH = os.getenv(
     "EARTH_BUMPMAP_MASK_SRC",
-    #str((settings.BASE_DIR / "assets" / "8k_earth_daymap_greyscale.jpg").resolve())
+    # str((settings.BASE_DIR / "assets" / "8k_earth_daymap_greyscale.jpg").resolve())
     str((settings.BASE_DIR / "assets" / "standin-economic-data.jpeg").resolve())
 )
 
@@ -99,23 +99,52 @@ def _auto_levels_u8(gray_u8: np.ndarray) -> np.ndarray:
     hi = int(gray_u8.max())
     if hi <= lo:
         return gray_u8
-    # scale to 0..255
     out = (gray_u8.astype(np.float32) - lo) * (255.0 / (hi - lo))
     return np.clip(out, 0, 255).astype(np.uint8)
+
+def _decide_invert_ocean_black(arr_gray_u8: np.ndarray) -> bool:
+    """
+    Heuristic for equirectangular world maps:
+    Sample a thin border ring (which should be ocean) and the interior.
+    If the border is *brighter* than the interior, flip so oceans become dark.
+    """
+    h, w = arr_gray_u8.shape
+    bw = max(8, int(min(w, h) * 0.04))  # ~4% ribbon, at least 8px
+
+    # border slices (corners double-counted is fine for a mean)
+    top = arr_gray_u8[:bw, :]
+    bottom = arr_gray_u8[-bw:, :]
+    left = arr_gray_u8[:, :bw]
+    right = arr_gray_u8[:, -bw:]
+
+    border_mean = float(
+        np.mean(np.concatenate([top.flatten(), bottom.flatten(), left.flatten(), right.flatten()]))
+    )
+
+    # interior (fallback to global mean if border eats everything)
+    if bw * 2 < h and bw * 2 < w:
+        interior = arr_gray_u8[bw:-bw, bw:-bw]
+        interior_mean = float(np.mean(interior))
+    else:
+        interior_mean = float(np.mean(arr_gray_u8))
+
+    # If border (ocean) is brighter than interior (land), invert to make ocean dark
+    return border_mean > interior_mean
 
 # ---------- endpoint ----------
 @api_view(["GET", "POST", "HEAD", "OPTIONS"])
 @parser_classes([MultiPartParser, FormParser])
 def bumpmap(request):
     """
-    Fast bumpmap: grayscale + gaussian blur.
+    Fast bumpmap: grayscale + optional invert (auto), gamma, blur.
+
+    Goal: oceans black (0), land white (255) by default.
 
     Params:
       - w, h: output size. If omitted -> keep source size.
       - blur: Gaussian blur radius in pixels (float, default 6.0)
-      - gamma: apply gamma correction (default 1.0; >1.0 darkens midtones)
-      - invert: 0/1 flip grayscale
-      - normalize: 0/1 scale to [0,1] before output (kept implicit in 8-bit)
+      - gamma: apply gamma correction after inversion (default 1.0; >1.0 darkens midtones)
+      - invert: "auto" (default), 1/true, 0/false
       - auto_levels: 0/1 stretch to full [0,255] after blur (default 1)
       - hard: 0/1 apply threshold at the end
       - threshold: 0..1 threshold if hard=1 (default 0.35)
@@ -126,7 +155,15 @@ def bumpmap(request):
     fmt = (request.GET.get("fmt", request.POST.get("fmt", "png")) or "png").lower()
     blur = float(request.GET.get("blur", request.POST.get("blur", 6.0)))
     gamma = float(request.GET.get("gamma", request.POST.get("gamma", 1.0)))
-    invert = _parse_bool(request.GET.get("invert", request.POST.get("invert")), False)
+
+    invert_param = request.GET.get("invert", request.POST.get("invert", "auto"))
+    invert_param = (invert_param or "auto").strip().lower()
+    invert_forced = None
+    if invert_param in ("auto",):
+        pass
+    else:
+        invert_forced = _parse_bool(invert_param, False)
+
     auto_levels = _parse_bool(request.GET.get("auto_levels", request.POST.get("auto_levels", 1)), True)
     hard = _parse_bool(request.GET.get("hard", request.POST.get("hard")), False)
     threshold = float(request.GET.get("threshold", request.POST.get("threshold", 0.35)))
@@ -147,18 +184,31 @@ def bumpmap(request):
         else:
             w, h = im_src.size
 
-        # Convert to grayscale
+        # Convert to grayscale (base for inversion decision)
         im_gray = ImageOps.grayscale(im_src)  # 'L'
+        arr0 = np.asarray(im_gray, dtype=np.uint8)
 
-        # Optional gamma (convert to float for precision)
+        # Decide inversion
+        if invert_forced is None:
+            invert_auto = _decide_invert_ocean_black(arr0)
+            effective_invert = invert_auto
+            invert_mode_str = f"auto:{int(effective_invert)}"
+        else:
+            effective_invert = bool(invert_forced)
+            invert_mode_str = f"forced:{int(effective_invert)}"
+
+        # Apply inversion if needed
+        if effective_invert:
+            arr = 255 - arr0
+        else:
+            arr = arr0
+
+        # Optional gamma (applied after inversion)
         if gamma and gamma != 1.0:
-            arr = np.asarray(im_gray, dtype=np.uint8)
             arrf = (arr.astype(np.float32) / 255.0) ** np.float32(gamma)
-            im_gray = Image.fromarray(np.clip(arrf * 255.0, 0, 255).astype(np.uint8), mode="L")
+            arr = np.clip(arrf * 255.0, 0, 255).astype(np.uint8)
 
-        # Invert if requested
-        if invert:
-            im_gray = ImageOps.invert(im_gray)
+        im_gray = Image.fromarray(arr, mode="L")
 
         # Gaussian blur (fast)
         blur = max(0.0, float(blur))
@@ -191,7 +241,7 @@ def bumpmap(request):
         f"{w}x{h}".encode(),
         f"blur={blur}".encode(),
         f"gamma={gamma}".encode(),
-        f"invert={int(invert)}".encode(),
+        f"invert={invert_mode_str}".encode(),
         f"autolvl={int(auto_levels)}".encode(),
         f"hard={int(hard)}".encode(),
         f"thr={threshold}".encode(),
@@ -204,6 +254,7 @@ def bumpmap(request):
     resp["ETag"] = etag
     resp["Cache-Control"] = "public, max-age=3600"
     return resp
+
 
 # --- Cloud map endpoint -----------------------------------------------------
 import io, hashlib, time
