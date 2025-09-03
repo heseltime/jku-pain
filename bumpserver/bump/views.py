@@ -1,14 +1,27 @@
 # bump/views.py
-import io, os, hashlib
+import io, os, hashlib, re
 from math import pi, asin, degrees
 import numpy as np
+import random
 from PIL import Image
 from django.http import HttpResponse, JsonResponse
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import AllowAny
-
 from django.conf import settings
 import colorsys
+from typing import Sequence, Tuple
+from django.urls import reverse
+
+try:
+    from openai import OpenAI
+except Exception:  # pragma: no cover
+    OpenAI = None
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+PLANETARY_FALLBACK_ENABLED = True
+OPENAI_TEXT_MODEL = "gpt-4.1-mini"  # or your preferred model
+# Ensure OPENAI_API_KEY is loaded (via dotenv or environment)
 
 EARTH_SRC_PATH = os.getenv(
     "EARTH_TEXTURE_SRC",
@@ -388,48 +401,207 @@ def earthtexture(request):
     resp["Cache-Control"] = "public, max-age=3600"
     return resp
 
-def _geo_from_text(personal_account: str, salt: str = ""):
-    """
-    Deterministically map arbitrary text -> (lat, lon) that is uniform on the sphere.
-    Uses a keyed BLAKE2b hash for stability and privacy.
-    """
+# ---- Config
+MAX_TEXT_LEN = 2000
+MAX_DESCRIPTORS = 16
+OPENAI_MODEL_DEFAULT = getattr(settings, "OPENAI_TEXT_MODEL", "gpt-4.1-mini")
+PLANETARY_FALLBACK_ENABLED = getattr(settings, "PLANETARY_FALLBACK_ENABLED", True)
+
+# ---- Sanitizers
+_CTRL = re.compile(r"[\x00-\x08\x0b-\x0c\x0e-\x1f]+")
+
+def _clean_text(s: str, max_len: int = MAX_TEXT_LEN) -> str:
+    if not isinstance(s, str):
+        s = str(s or "")
+    s = _CTRL.sub("", s)
+    s = " ".join(s.split())
+    return s[:max_len].strip()
+
+def _clean_descriptors(items) -> list:
+    if not items:
+        return []
+    out, seen = [], set()
+    for x in items:
+        t = _clean_text(str(x), max_len=48)
+        if t and t.lower() not in seen:
+            seen.add(t.lower()); out.append(t)
+        if len(out) >= MAX_DESCRIPTORS:
+            break
+    return out
+
+# ---- Deterministic geo from text (uniform on sphere)
+def _geo_from_text(personal_account: str, salt: str = "") -> Tuple[float, float, str]:
+    msg = (personal_account or "").encode("utf-8")
     key = (salt or "").encode("utf-8")
-    h = hashlib.blake2b(personal_account.encode("utf-8"), digest_size=16, key=key).digest()
-    a = int.from_bytes(h[:8], "big", signed=False)
-    b = int.from_bytes(h[8:], "big", signed=False)
+    h = hashlib.blake2b(msg, digest_size=16, key=key).digest()
+    a = int.from_bytes(h[:8], "big"); b = int.from_bytes(h[8:], "big")
+    u = (a / 2**64) * 2.0 - 1.0         # [-1, 1]
+    v = b / 2**64                        # [0, 1)
+    lat = degrees(asin(max(-1.0, min(1.0, u))))     # [-90, 90]
+    lon = (v * 360.0) - 180.0                        # [-180, 180)
+    return lat, lon, h.hex()[:16]
 
-    u = (a / 2**64) * 2.0 - 1.0         # uniform in [-1, 1]
-    v = b / 2**64                        # uniform in [0, 1)
+# ---- Local fallback generator (NEVER echoes inputs)
+def _local_planetary_view(
+    personal_account: str,
+    descriptors: Sequence[str],
+    lat: float,
+    lon: float,
+) -> str:
+    """
+    Standalone paragraph; does not quote/mention the submitted text, keywords, or any country.
+    Uses a deterministic seed derived from personal_account for style variety.
+    """
+    seed = int(hashlib.blake2b(personal_account.encode(), digest_size=8).hexdigest(), 16)
+    rng = random.Random(seed)
 
-    lat = degrees(asin(max(-1.0, min(1.0, u))))  # [-90, 90]
-    lon = (v * 360.0) - 180.0                     # [-180, 180)
+    # Word pools (influenced only by RNG; no direct echoing)
+    lenses = ["personal", "ecological", "intergenerational", "socio-economic", "collective"]
+    verbs = ["ripple", "braid", "converge", "echo", "spiral", "interlace"]
+    motifs = ["smoke", "dust", "heat", "noise", "flood", "drought", "metal", "ash", "salt"]
+    tones  = ["tender", "grounded", "clear-eyed", "resolute", "steadfast"]
 
-    return lat, lon, h.hex()[:16]  # short seed id for debugging
+    lens = ", ".join(rng.sample(lenses, 2))
+    verb = rng.choice(verbs)
+    motif = ", ".join(rng.sample(motifs, 2))
+    tone = rng.choice(tones)
+
+    # Build a 100–160 word-ish paragraph without referring to inputs
+    body = (
+        f"Pain is not solitary. It {verb}s across bodies and biomes, tying {lens} layers together. "
+        f"In the currents of daily life, signals condense as {motif}, and pressure gathers across air, water, soil, and supply chains. "
+        f"What seems isolated is braided with ecosystems, labor, and time—an ache that travels through households, rivers, forests, and markets. "
+        f"The work is to witness and repair: trace the contours, render them visible, and act in kinship with more-than-human worlds. "
+        f"Attunement is a practice: map, name, convene, and transform. ({tone}) "
+        f"#SharedPain #PlanetaryHealth #PPPMap"
+    )
+    return " ".join(body.split())[:1000]
 
 @api_view(["POST"])
 @permission_classes([AllowAny])
-def locate_pain(request):
+def planetary_pain_text(request):
     """
-    POST JSON: { "personal_account": "..." }
-    -> { "lat": ..., "lon": ..., "seed": "...", "bumpmap_url": "..." }
+    POST JSON:
+      {
+        "personal_account": "...",            # required (used for seeding only)
+        "pain_descriptors": ["anxiety"...],   # optional (not echoed)
+        "country": "..."                      # optional (ignored in output)
+      }
+    Always returns a standalone paragraph that does not reference inputs.
     """
-    personal_account = (request.data.get("personal_account") or "").strip()
+    # Parse input
+    personal_account = _clean_text(request.data.get("personal_account", ""))
     if not personal_account:
         return JsonResponse({"error": "personal_account is required"}, status=400)
+    pain_descriptors = _clean_descriptors(request.data.get("pain_descriptors"))
+    # country may be provided but MUST NOT be mentioned in output
+    _ = _clean_text(request.data.get("country", ""), max_len=64)  # parsed then ignored
 
-    # Optional instance-specific salt so the mapping can't be trivially reversed elsewhere
-    salt = getattr(settings, "PAIN_GEO_SALT", settings.SECRET_KEY[:16])
-
+    # Deterministic geo anchor
+    salt = getattr(settings, "PAIN_GEO_SALT", (settings.SECRET_KEY or "")[:16])
     lat, lon, seed_id = _geo_from_text(personal_account, salt=salt)
 
-    # Handy link to your existing bumpmap endpoint for immediate visualization
-    bumpmap_url = f"/bumpmap?w=2048&h=1024&lat={lat:.6f}&lon={lon:.6f}&sigma=20"
+    # Bumpmap link
+    try:
+        bumpmap_base = request.build_absolute_uri(reverse("bumpmap"))
+    except Exception:
+        bumpmap_base = request.build_absolute_uri("/api/bumpmap/")
+    bumpmap_url = f"{bumpmap_base}?w=2048&h=1024&lat={lat:.6f}&lon={lon:.6f}&sigma=20"
 
+    # Try OpenAI (without sending the personal text or country)
+    api_key = getattr(settings, "OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
+    model = OPENAI_MODEL_DEFAULT
+
+    if OpenAI and api_key:
+        try:
+            client = OpenAI(api_key=api_key, timeout=15)
+
+            # We provide only internal anchors; we DO NOT include user text or country.
+            # We also instruct the model explicitly to avoid referencing inputs.
+            instructions = (
+                "You are an artist-ecologist voice for the PPP (Personal–Planetary–Pain) map. "
+                "Write ONE standalone paragraph (100–160 words) that connects personal, ecological, "
+                "and socio-economic dimensions of shared pain. Keep it grounded, sensory, constructive. "
+                "Never address the reader; never mention prompts, inputs, coordinates, countries, or keywords. "
+                "Do not quote or paraphrase any provided text. End with 3 short hashtags."
+            )
+
+            # Lightweight internal cues (seed + hidden coords) are given ONLY as internal guidance.
+            # The model is told not to reveal or reference them.
+            internal_cues = (
+                f"Internal anchors (do NOT mention in output): "
+                f"seed={seed_id}, lat={lat:.4f}, lon={lon:.4f}."
+            )
+
+            # Optionally nudge tone using hashed choices from descriptors (without listing them)
+            rng = random.Random(int(hashlib.blake2b("|".join(pain_descriptors).encode(), digest_size=8).hexdigest(), 16) if pain_descriptors else 0)
+            tone_words = ["tender", "grounded", "clear-eyed", "resolute", "steadfast"]
+            tone_hint = rng.choice(tone_words) if pain_descriptors else "grounded"
+
+            user_input = (
+                f"{internal_cues}\n"
+                f"Desired tone (do NOT mention explicitly): {tone_hint}.\n"
+                "Task: Produce the paragraph now."
+            )
+
+            resp = client.responses.create(
+                model=model,
+                instructions=instructions,
+                input=user_input,
+                max_output_tokens=500
+            )
+            text = (resp.output_text or "").strip()
+            if not text:
+                raise RuntimeError("Empty response text from OpenAI")
+
+            # best-effort post-filter: strip accidental mentions
+            text = re.sub(r"\b(Chile|Argentina|USA|United States|China|India|Europe|Africa|Asia|Australia)\b", " ", text)
+            text = re.sub(r"\b(descriptors?|keywords?|prompt|input|coordinates?|latitude|longitude)\b", " ", text, flags=re.I)
+            text = " ".join(text.split())
+
+            return JsonResponse({
+                "planetary_view": text,
+                "source": "openai",
+                "model": model,
+                "deterministic_seed": seed_id,
+                "lat": round(lat, 6),
+                "lon": round(lon, 6),
+                "bumpmap_url": bumpmap_url
+            }, status=200)
+
+        except Exception as e:
+            if PLANETARY_FALLBACK_ENABLED:
+                text = _local_planetary_view(
+                    personal_account=personal_account,
+                    descriptors=pain_descriptors,
+                    lat=lat,
+                    lon=lon,
+                )
+                resp = JsonResponse({
+                    "planetary_view": text,
+                    "source": "local_fallback",
+                    "error": f"openai_error:{e.__class__.__name__}",
+                    "deterministic_seed": seed_id,
+                    "lat": round(lat, 6),
+                    "lon": round(lon, 6),
+                    "bumpmap_url": bumpmap_url
+                }, status=200)
+                resp["Retry-After"] = "60"
+                return resp
+            return JsonResponse({"error": "OpenAI unavailable"}, status=502)
+
+    # No OpenAI configured → fallback
+    text = _local_planetary_view(
+        personal_account=personal_account,
+        descriptors=pain_descriptors,
+        lat=lat,
+        lon=lon,
+    )
     return JsonResponse({
+        "planetary_view": text,
+        "source": "local_fallback",
+        "deterministic_seed": seed_id,
         "lat": round(lat, 6),
         "lon": round(lon, 6),
-        "deterministic": True,
-        "seed": seed_id,
-        "bumpmap_url": bumpmap_url,
-        "method": "hash->uniform-sphere(asin)"
+        "bumpmap_url": bumpmap_url
     }, status=200)

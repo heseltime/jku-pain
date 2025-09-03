@@ -117,7 +117,7 @@ curl -L -o earth_cmy_soft.png \
 Multi-color hue version of the earth map. Generates a soft, multi-hue CMY heat-map version of the grayscale Earth day texture (cyan → magenta → yellow with gentle dark/bright knees).
 
 
-## locate_pain
+## planetary_pain_text
 
 ### Input
 
@@ -130,22 +130,32 @@ Text pain prompt.
 ### Examples
 
 ```bash
-curl -X POST http://localhost:8000/api/locate-pain \
+curl -X POST http://localhost:8000/api/planetary-pain \
   -H "Content-Type: application/json" \
   -d '{"personal_account":"I feel a tightness in my chest when thinking about wildfires."}'
 ```
 
+```bash
+curl -X POST http://localhost:8000/api/planetary-pain \
+  -H "Content-Type: application/json" \
+  -d '{
+    "personal_account":"I feel a tightness in my chest when thinking about wildfires.",
+    "pain_descriptors":["anxiety","smog","deforestation"],
+    "country":"Chile"
+  }'
+```
+
 ### Output
 
-Location coordinates mainly:
+Location coordinates mainly, and pain signature (DTO needed) as well as a first-person pain narrative combining personal and social/ecological pain, the plantary perspective, e.g.
 
 ```bash
-{
-    "lat": -68.269179, 
-    "lon": -111.796729, 
-    "deterministic": true, 
-    "seed": "0918b4a9b7469719", 
-    "bumpmap_url": "/bumpmap?w=2048&h=1024&lat=-68.269179&lon=-111.796729&sigma=20", 
-    "method": "hash->uniform-sphere(asin)"
-}
+{"planetary_view": "Pain is not solitary. It braids across bodies and biomes, tying ecological, intergenerational layers together. In the currents of daily life, signals condense as salt, heat, and pressure gathers across air, water, soil, and supply chains. What seems isolated is braided with ecosystems, labor, and time\u2014an ache that travels through households, rivers, forests, and markets. The work is to witness and repair: trace the contours, render them visible, and act in kinship with more-than-human worlds. Attunement is a practice: map, name, convene, and transform. (tender) #SharedPain #PlanetaryHealth #PPPMap", 
+"source": "local_fallback", 
+"error": "openai_error:RateLimitError", 
+"deterministic_seed": "0918b4a9b7469719", 
+"lat": -68.269179, 
+"lon": -111.796729, 
+"bumpmap_url": "http://localhost:8000/api/bumpmap/?w=2048&h=1024&lat=-68.269179&lon=-111.796729&sigma=20"}
 ```
+
