@@ -28,6 +28,11 @@ EARTH_SRC_PATH = os.getenv(
     str((settings.BASE_DIR / "assets" / "8k_earth_daymap_greyscale.jpg").resolve())
 )
 
+EARTH_BUMPMAP_MASK_PATH = os.getenv(
+    "EARTH_BUMPMAP_MASK_SRC",
+    str((settings.BASE_DIR / "assets" / "8k_earth_daymap_greyscale.jpg").resolve())
+)
+
 def _parse_bool(v, default=False):
     return str(v).lower() in ("1","true","t","yes","y","on") if v is not None else default
 
